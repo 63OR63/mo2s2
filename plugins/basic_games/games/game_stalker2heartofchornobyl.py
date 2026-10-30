@@ -395,7 +395,7 @@ class Mo2S2Game(BasicGame, mobase.IPluginFileMapper, mobase.IPluginDiagnose):
     Name = 'S.T.A.L.K.E.R. 2: Heart of Chornobyl Support Plugin'
     Description = 'Adds support for game S.T.A.L.K.E.R. 2: Heart of Chornobyl.'
     Author = '63OR63'
-    Version = '1.0'
+    Version = '1.0.1'
     GameName = 'Stalker 2: Heart of Chornobyl'
     GameShortName = 'stalker2heartofchornobyl'
     GameNexusName = 'stalker2heartofchornobyl'
@@ -1055,6 +1055,19 @@ class Mo2S2Game(BasicGame, mobase.IPluginFileMapper, mobase.IPluginDiagnose):
                                           approved_plan=approved_plan)
         self._log('INFO', f'Repair of {name}: prepared {result} paths')
         return result
+
+    def paksDirectory(self):
+        return QDir(str(Path(self.gameDirectory().absolutePath()) / 'Stalker2/Content/Paks'))
+
+    def paksModsDirectory(self):
+        return QDir(str(Path(self.paksDirectory().absolutePath()) / '~mods'))
+
+    def logicModsDirectory(self):
+        return QDir(str(Path(self.paksDirectory().absolutePath()) / 'LogicMods'))
+
+    def getModMappings(self):
+        return {'Content/Paks/~mods': [self.paksModsDirectory().absolutePath()],
+                'Content/Paks': [self.paksDirectory().absolutePath()]}
 
     def activeProblems(self):
         """Return diagnosis keys for problems in the active mod configuration."""

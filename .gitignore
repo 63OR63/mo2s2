@@ -131,6 +131,7 @@ dmypy.json
 # Edit below this line
 
 /dev
+/tmp
 /publish
 .vscode
 .VSCodeCounter
