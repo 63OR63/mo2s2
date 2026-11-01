@@ -7,14 +7,16 @@ from __future__ import annotations
 
 from threading import Event
 
+_SIGNATURE_UNREADABLE = object()
+
 from PyQt6.QtCore import QObject, QThread, QTimer, Qt, QSignalBlocker, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QApplication, QMenu,
 )
 
-from .indexer import (Catalog, CatalogCancelled, Snapshot, discover,
-                      bounded_partner_preview, collision_losers)
+from .indexer import (CatalogCancelled, Snapshot, discover,
+                      bounded_partner_preview, collision_losers, run_with_cache_recovery)
 from .tree_actions import set_branch_expanded, navigation_targets
 
 
@@ -28,6 +30,7 @@ class _Worker(QObject):
         self.path, self.items, self.force = path, list(items), force
         self.generation = generation
         self.cancelled = Event()
+        self.recovery_notice = ''
 
     @pyqtSlot()
     def run(self):
@@ -35,8 +38,8 @@ class _Worker(QObject):
             sources, errors = discover(self.items, is_cancelled=self.cancelled.is_set)
             if self.cancelled.is_set():
                 raise CatalogCancelled()
-            with Catalog(self.path) as db:
-                stats = db.sync(sources, force=self.force,
+            def build(db, recovered, notice):
+                stats = db.sync(sources, force=self.force or recovered,
                     on_progress=lambda i, total, name: self.progress.emit(
                         self.generation, i, total, name),
                     is_cancelled=self.cancelled.is_set)
@@ -45,11 +48,15 @@ class _Worker(QObject):
                 snapshot = db.snapshot(sources, errors,
                     known_mods={item.mod_name for item in self.items},
                     is_cancelled=self.cancelled.is_set, repair=True)
-                # Cache repairs count as actual index reads, not cache hits.
                 if db.last_cache_corrupt:
                     stats = (stats[0] + db.last_repaired,
                              max(0, stats[1] - db.last_cache_corrupt),
                              stats[2] + db.last_cache_corrupt - db.last_repaired)
+                if recovered:
+                    self.recovery_notice = notice or 'Damaged catalog cache quarantined and rebuilt'
+                return snapshot, stats
+            snapshot, stats = run_with_cache_recovery(
+                self.path, build, is_cancelled=self.cancelled.is_set)
             if self.cancelled.is_set():
                 raise CatalogCancelled()
             self.done.emit(self.generation, snapshot, stats)
@@ -131,12 +138,16 @@ class _View(QWidget):
         layout.addLayout(foot)
 
     def _mod_user_activated(self, *_):
+        if not self.controller._ensure_current_snapshot():
+            return
         self.controller._focus_pending = False  # Preserve the user's explicit catalog selection.
         mod = self.mod.currentData()
         if mod:
             self.controller.navigate_mods.emit((mod,))
 
     def _conflict_targets(self, item, section):
+        if not self.controller._ensure_current_snapshot():
+            return ()
         payload = item.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(payload, tuple) or not payload:
             return ()
@@ -155,6 +166,8 @@ class _View(QWidget):
 
     def _contents_context_menu(self, pos):
         """Read-only resource actions using the indexed full path, not tree text."""
+        if not self.controller._ensure_current_snapshot():
+            return
         item = self.tree.itemAt(pos)
         if item is None:
             return
@@ -165,17 +178,23 @@ class _View(QWidget):
         menu = QMenu(self.tree)
         copy_path = menu.addAction('Copy resource path')
         copy_path.triggered.connect(
-            lambda: QApplication.clipboard().setText(path))
+            lambda *_: (QApplication.clipboard().setText(path)
+                       if self.controller._ensure_current_snapshot() else None))
         copy_owners = menu.addAction('Copy owning mods')
         copy_owners.triggered.connect(
-            lambda: QApplication.clipboard().setText('\n'.join(owners)))
+            lambda *_: (QApplication.clipboard().setText('\n'.join(owners))
+                       if self.controller._ensure_current_snapshot() else None))
         if owners:
             menu.addSeparator()
             go = menu.addAction('Select owning mods in MO2')
-            go.triggered.connect(lambda: self.controller.navigate_mods.emit(owners))
+            go.triggered.connect(
+                lambda *_: (self.controller.navigate_mods.emit(owners)
+                           if self.controller._ensure_current_snapshot() else None))
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def _conflict_context_menu(self, pos):
+        if not self.controller._ensure_current_snapshot():
+            return
         item = self.tree.itemAt(pos)
         if item is None:
             return
@@ -187,7 +206,9 @@ class _View(QWidget):
             if targets:
                 action = menu.addAction(label)
                 action.triggered.connect(
-                    lambda checked=False, targets=targets: self.controller.navigate_mods.emit(targets))
+                    lambda checked=False, targets=targets: (
+                        self.controller.navigate_mods.emit(targets)
+                        if self.controller._ensure_current_snapshot() else None))
         if not menu.actions():
             return
         menu.exec(self.tree.viewport().mapToGlobal(pos))
@@ -231,6 +252,8 @@ class _View(QWidget):
         self.show_results()
 
     def show_results(self, *_):
+        if not self.controller._ensure_current_snapshot():
+            return
         snap = self.controller.snapshot
         if snap is None:
             return
@@ -336,6 +359,9 @@ class CatalogTabs(QObject):
         self._worker = None
         self._closing = False
         self._generation = 0
+        self._catalog_signature = None
+        self._pending_signature = None
+        self._deferred_signature = None
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._shutdown)
@@ -343,11 +369,35 @@ class CatalogTabs(QObject):
         # TOC is still parsing, QObject would otherwise destroy a live thread.
         parent.destroyed.connect(self._shutdown)
 
+    def _live_signature(self):
+        """Read cheap MO2 identity; never inspect PAK payloads in the UI."""
+        getter = getattr(self.game, 'mod_signature', None)
+        if not callable(getter):
+            return None  # Allows host-free unit-test stubs.
+        try:
+            return getter()
+        except (OSError, RuntimeError, ValueError, TypeError):
+            return _SIGNATURE_UNREADABLE
+
+    def _signature_current(self):
+        if self._catalog_signature is None:
+            return True  # Older host/test doubles without identity API.
+        return self._live_signature() == self._catalog_signature
+
+    def _ensure_current_snapshot(self):
+        """Reject stale Contents/Conflicts even before MO2 emits its callback."""
+        if self.snapshot is None:
+            return False
+        if self._signature_current():
+            return True
+        self.invalidate(self.items)
+        return False
+
     def focus_mod(self, name):
         """Follow one left-pane mod (or All for multi-selection), no tab switching."""
         self._focused_mod = name
         self._focus_pending = True
-        if self.snapshot is None:
+        if not self._ensure_current_snapshot():
             return
         for view in (self.contents, self.conflicts):
             index = view.mod.findData(name)
@@ -355,8 +405,13 @@ class CatalogTabs(QObject):
                 view.mod.setCurrentIndex(index)
 
     def _shutdown(self, *_):
+        # Qt can signal both application shutdown and parent destruction.
+        if self._closing:
+            return
         self._closing = True
         self._pending = None
+        self._pending_signature = None
+        self._deferred_signature = None
         # Keep a local reference: finished may be delivered synchronously
         # during quit() and clear self._thread before wait() is reached.
         thread = self._thread
@@ -367,19 +422,51 @@ class CatalogTabs(QObject):
             thread.quit()
             thread.wait()
 
-    def request(self, items, *, force=False):
+    def _same_index_request(self, items, *, force, signature):
+        """Do not cancel an identical in-flight index or lose queued force scans.
+
+        Identity includes both the MO2 profile signature and discovered packages:
+        a repaired physical mod can change without a profile-order change.
+        Unreadable signatures never authorize reuse of cached work.
+        """
+        if (not self._working or signature is None or
+                signature is _SIGNATURE_UNREADABLE):
+            return False
+        if self._pending is not None:
+            pending_items, pending_force = self._pending
+            if items != pending_items or signature != self._pending_signature:
+                return False
+            if force and not pending_force:
+                self._pending = (pending_items, True)
+            return True
+        if signature != self._catalog_signature or items != self.items:
+            return False
+        worker = self._worker
+        return (worker is not None and not worker.cancelled.is_set() and
+                (not force or worker.force))
+
+    def request(self, items, *, force=False, signature=None):
         """Schedule the latest catalog refresh and supersede obsolete workers."""
         if self._closing:
             return
-        self.items = list(items)
-        self._generation += 1  # Invalidate queued results and progress from earlier requests.
+        requested = list(items)
+        identity = signature if signature is not None else self._live_signature()
+        if self._same_index_request(requested, force=force, signature=identity):
+            return
+        self._deferred_signature = None
+        self.items = requested
+        self._catalog_signature = identity
+        self._generation += 1  # Reject late progress/results from previous jobs.
         generation = self._generation
-        # Do not show a previously selected profile as if it were current.
         self.snapshot = None
         for view in (self.contents, self.conflicts):
             view.tree.clear()
         if self._working:
-            self._pending = (self.items, force or (self._pending[1] if self._pending else False))
+            # If a forced reindex was already queued, an ordinary event must
+            # not downgrade it while the old worker is being cancelled.
+            queued_force = self._pending[1] if self._pending else False
+            self._pending = (self.items, force or queued_force)
+            self._pending_signature = identity
             if self._worker is not None:
                 self._worker.cancelled.set()
             for view in (self.contents, self.conflicts):
@@ -396,34 +483,55 @@ class CatalogTabs(QObject):
         thread.started.connect(worker.run)
         worker.progress.connect(self._progress)
         worker.done.connect(self._finished)
-        worker.done.connect(thread.quit)
+        # Quit must not depend on the GUI thread processing a queued signal:
+        # shutdown can block the GUI while waiting for this worker to finish.
+        worker.done.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(lambda: self._thread_ended(thread))
         thread.start()
 
     def invalidate(self, items):
-        """Mark the catalog stale without scanning while Archives is selected.
-
-        Otherwise a user can reorder mods in Archives, then switch to
-        Contents and see the old Snapshot (because it was non-None).
-        """
+        """Defer indexing from Archives, discarding only changed inventories."""
         if self._closing:
             return
-        self.items = list(items)
+        requested = list(items)
+        identity = self._live_signature()
+        if (identity is not None and identity is not _SIGNATURE_UNREADABLE
+                and requested == self.items):
+            if self._working:
+                if self._pending is not None:
+                    if (requested == self._pending[0] and
+                            identity == self._pending_signature):
+                        return
+                elif (identity == self._catalog_signature and
+                        self._worker is not None and
+                        not self._worker.cancelled.is_set()):
+                    return
+            elif ((self.snapshot is not None and
+                   identity == self._catalog_signature) or
+                  (self.snapshot is None and
+                   identity == self._deferred_signature)):
+                return
+
+        self.items = requested
+        self._deferred_signature = identity
+        self._catalog_signature = None
         self._generation += 1
         self.snapshot = None
         for view in (self.contents, self.conflicts):
             view.tree.clear()
             view.status.setText('Mod list changed; open Contents or Conflicts to update.')
         if self._working:
-            # The running snapshot refers to the previous profile/order.
-            # Cancel and queue a latest-state replacement.
-            self._pending = (self.items, False)
+            queued_force = self._pending[1] if self._pending else False
+            self._pending = (self.items, queued_force)
+            self._pending_signature = identity
             if self._worker is not None:
                 self._worker.cancelled.set()
 
     def copy_report(self):
+        if self.snapshot is not None and not self._ensure_current_snapshot():
+            return
         if self.snapshot is None:
             for view in (self.contents, self.conflicts):
                 view.status.setText('No catalog snapshot yet. Open Contents and wait for indexing.')
@@ -445,6 +553,9 @@ class CatalogTabs(QObject):
         if (self._closing or generation != self._generation or
                 self._pending is not None):
             return
+        if not self._signature_current():
+            self.invalidate(self.items)
+            return
         if snapshot is None:
             if stats != 'cancelled':
                 logger = getattr(self.game, '_log', None)
@@ -454,6 +565,10 @@ class CatalogTabs(QObject):
                 view.status.setText(f'Catalog failed: {stats}')
             return
         self.snapshot = snapshot
+        if self._worker is not None and self._worker.recovery_notice:
+            logger_recovery = getattr(self.game, '_log', None)
+            if callable(logger_recovery):
+                logger_recovery('WARNING', self._worker.recovery_notice)
         logger = getattr(self.game, '_log_unique', None)
         if callable(logger):
             for mod_name, messages in snapshot.errors.items():
@@ -479,5 +594,7 @@ class CatalogTabs(QObject):
             view.force.setEnabled(True)
         if self._pending:
             items, force = self._pending
+            signature = self._pending_signature
             self._pending = None
-            self.request(items, force=force)
+            self._pending_signature = None
+            self.request(items, force=force, signature=signature)

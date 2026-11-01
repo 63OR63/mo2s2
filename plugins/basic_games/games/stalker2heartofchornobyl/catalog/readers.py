@@ -138,6 +138,72 @@ def _encoded_entry_offsets(data: bytes, count: int) -> array:
     return starts
 
 
+def _looks_like_legacy_ansi_name(data: bytes, at: int) -> bool:
+    """Heuristic from CoMod's legacy entry alignment handling.
+
+    Applied only after an empty, uncompressed legacy entry: do not silently
+    skip arbitrary bytes in an ordinary index record or UTF-16 name.
+    """
+    if at < 0 or at + 5 > len(data):
+        return False
+    count = struct.unpack_from('<i', data, at)[0]
+    if count < 2 or count > 1024 or at + 4 + count > len(data):
+        return False
+    name = data[at + 4:at + 4 + count]
+    return name[-1] == 0 and all(32 <= b <= 126 for b in name[:-1])
+
+
+def _skip_legacy_empty_entry_padding(reader: Reader) -> None:
+    """Accept optional four-byte alignment only when next ANSI name proves it.
+
+    Some legacy writers emit an extra four-byte field after an empty record.
+    Never guess for compressed or nonempty records, and never move the cursor
+    if a valid name is already present at the current location.
+    """
+    at = reader.pos
+    if (not _looks_like_legacy_ansi_name(reader.data, at)
+            and _looks_like_legacy_ansi_name(reader.data, at + 4)):
+        reader.take(4)
+
+
+def _read_nonencoded_pak_records(reader: Reader, count: int, index_at: int):
+    """Decode full FPakEntry metadata used by modern PAK directory references.
+
+    Unlike compact encoded entries these records have block tables inline in
+    the primary index. Do not confuse negative directory references with bad
+    offsets: Unreal stores their index as ``-record_number - 1``.
+    """
+    if count < 0 or count > MAX_ENTRIES:
+        raise IndexErrorUnsupported('Invalid non-encoded PAK entry count')
+    records = []
+    for _ in range(count):
+        offset = reader.num('q')
+        compressed = reader.num('q')
+        raw = reader.num('q')
+        method = reader.num('I')
+        reader.take(20)  # Per-entry SHA-1; primary index SHA checked separately.
+        if method > 5:
+            raise IndexErrorUnsupported('Unsupported non-encoded PAK compression method')
+        blocks = 0
+        if method:
+            blocks = reader.count()
+            if blocks > MAX_ENTRIES or blocks * 16 > len(reader.data) - reader.pos:
+                raise IndexErrorUnsupported('Invalid non-encoded PAK block table')
+            previous_end = -1
+            for _ in range(blocks):
+                start, end = reader.num('q'), reader.num('q')
+                if start < 0 or end < start or start < previous_end:
+                    raise IndexErrorUnsupported('Invalid non-encoded PAK block offsets')
+                previous_end = end
+        flags = reader.num('B')
+        reader.num('I')  # Compression block size.
+        if (flags & ~3 or offset < 0 or offset >= index_at or
+                compressed < 0 or raw < 0):
+            raise IndexErrorUnsupported('Invalid non-encoded PAK entry metadata')
+        records.append((offset, compressed, raw, method, blocks, bool(flags & 1)))
+    return records
+
+
 def _pak_footer(stream, size: int):
     """Locate an exact FPakInfo versioned trailer, including legacy PAKs.
 
@@ -173,7 +239,7 @@ def _legacy_pak_inventory(primary: bytes, *, version: int, index_at: int,
     mount = reader.fstring()
     count = reader.count()
     names = []
-    for _ in range(count):
+    for entry_number in range(count):
         name = reader.fstring()
         offset = reader.num('q')
         compressed = reader.num('q')
@@ -205,6 +271,9 @@ def _legacy_pak_inventory(primary: bytes, *, version: int, index_at: int,
             deleted = False
         if offset < 0 or offset >= index_at or compressed < 0 or uncompressed < 0:
             raise IndexErrorUnsupported('Legacy PAK entry lies outside resource data')
+        if (version >= 3 and entry_number + 1 < count and method == 0
+                and uncompressed == 0):
+            _skip_legacy_empty_entry_padding(reader)
         if not deleted:
             names.append(resource_name(mount, name))
     if reader.pos != len(primary):
@@ -251,12 +320,11 @@ def read_pak(path: Path) -> Inventory:
         if encoded_count < 0 or encoded_count > MAX_INDEX:
             raise IndexErrorUnsupported('Invalid encoded PAK entry size')
         encoded = r.take(encoded_count)
-        encoded_starts = _encoded_entry_offsets(encoded, count)
-        # The primary v10/v11 index ends with the non-encoded entry count.
-        # Ignoring it makes unsupported entry offsets look like valid paths.
         non_encoded_count = r.count()
-        if non_encoded_count:
-            raise IndexErrorUnsupported('Non-encoded PAK entries are unsupported')
+        non_encoded = _read_nonencoded_pak_records(r, non_encoded_count, start)
+        if non_encoded_count > count:
+            raise IndexErrorUnsupported('Non-encoded PAK count exceeds file count')
+        encoded_starts = _encoded_entry_offsets(encoded, count - non_encoded_count)
         if r.pos != len(primary):
             raise IndexErrorUnsupported('Unexpected trailing PAK primary index data')
         if path_hash_descriptor is not None:
@@ -286,13 +354,20 @@ def read_pak(path: Path) -> Inventory:
         for _ in range(r.count()):
             name = r.fstring()
             entry_location = r.num('i')
-            # Negative offsets refer to the separately serialized FPakEntry
-            # table, which this metadata-only reader deliberately omits.
-            if entry_location < 0 or entry_location >= encoded_count:
-                raise IndexErrorUnsupported('Invalid or non-encoded PAK entry reference')
-            k = bisect_left(encoded_starts, entry_location)
-            if k == len(encoded_starts) or encoded_starts[k] != entry_location:
-                raise IndexErrorUnsupported('PAK entry reference is not a record boundary')
+            # CUE4Parse skips the sentinel used for deleted directory entries.
+            # It is not a negative non-encoded FPakEntry reference.
+            if entry_location == -(1 << 31):
+                continue
+            if entry_location < 0:
+                record_index = -entry_location - 1
+                if record_index >= len(non_encoded):
+                    raise IndexErrorUnsupported('Invalid non-encoded PAK entry reference')
+            else:
+                if entry_location >= encoded_count:
+                    raise IndexErrorUnsupported('Invalid encoded PAK entry reference')
+                k = bisect_left(encoded_starts, entry_location)
+                if k == len(encoded_starts) or encoded_starts[k] != entry_location:
+                    raise IndexErrorUnsupported('PAK entry reference is not a record boundary')
             names.append(resource_name(mount, folder + name))
             if len(names) > MAX_ENTRIES:
                 raise IndexErrorUnsupported('Too many PAK resources')

@@ -395,7 +395,7 @@ class Mo2S2Game(BasicGame, mobase.IPluginFileMapper, mobase.IPluginDiagnose):
     Name = 'S.T.A.L.K.E.R. 2: Heart of Chornobyl Support Plugin'
     Description = 'Adds support for game S.T.A.L.K.E.R. 2: Heart of Chornobyl.'
     Author = '63OR63'
-    Version = '1.0.1'
+    Version = '1.0.2'
     GameName = 'Stalker 2: Heart of Chornobyl'
     GameShortName = 'stalker2heartofchornobyl'
     GameNexusName = 'stalker2heartofchornobyl'
@@ -431,7 +431,10 @@ class Mo2S2Game(BasicGame, mobase.IPluginFileMapper, mobase.IPluginDiagnose):
         self._logged_diagnostics: set[str] = set()
 
     def _log_unique(self, severity, message):
-        if message not in self._logged_diagnostics:
+        levels = {'ERROR': 0, 'WARNING': 1, 'INFO': 1,
+                  'VERBOSE': 2, 'DEBUG': 3}
+        if (message not in self._logged_diagnostics and
+                verbosity_level(self._setting('Verbosity', 1)) >= levels.get(severity, 1)):
             self._log(severity, message)
             if len(self._logged_diagnostics) >= 512:
                 self._logged_diagnostics.clear()
@@ -469,12 +472,14 @@ class Mo2S2Game(BasicGame, mobase.IPluginFileMapper, mobase.IPluginDiagnose):
                   'VERBOSE': 2}
         if verbosity_level(self._setting('Verbosity', 1)) < levels.get(severity, 1):
             return
-        message = f'[mo2s2] [{severity}] {message}'
+        # Bound diagnostic output; a large archive report must not flood MO2.
+        message = f'[mo2s2] [{severity}] {str(message)[:2048]}'
         try:
             from PyQt6 import QtCore
+            # MO2/Qt can suppress qDebug independently of our Verbosity setting.
             fn = getattr(QtCore, {'ERROR': 'qCritical', 'WARNING': 'qWarning',
                                   'INFO': 'qInfo', 'VERBOSE': 'qInfo',
-                                  'DEBUG': 'qDebug'}[severity])
+                                  'DEBUG': 'qInfo'}[severity])
             fn(message)
         except (ImportError, KeyError, AttributeError, RuntimeError, TypeError):
             print(message, file=sys.stderr)

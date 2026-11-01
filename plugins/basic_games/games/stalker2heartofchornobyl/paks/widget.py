@@ -197,13 +197,21 @@ class Mo2S2VirtualPaksWidget(QWidget):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         mod_list = organizer.modList()
-        for event in ('onModMoved', 'onModInstalled', 'onModRemoved', 'onModStateChanged'):
+        for event in ('onModMoved', 'onModInstalled', 'onModRemoved'):
             callback = getattr(mod_list, event, None)
             if callable(callback):
                 try:
                     callback(lambda *args: self.host_changed.emit())
                 except (RuntimeError, TypeError, AttributeError):
                     pass
+        on_states = getattr(mod_list, 'onModStateChanged', None)
+        if callable(on_states):
+            try:
+                # A fixed one-argument signature selects the non-deprecated
+                # MO2 overload (dict of changed mod names to states).
+                on_states(self._on_mod_states_changed)
+            except (RuntimeError, TypeError, AttributeError):
+                pass
         callback = getattr(organizer, 'onProfileChanged', None)
         if callable(callback):
             try:
@@ -225,6 +233,10 @@ class Mo2S2VirtualPaksWidget(QWidget):
     def _attach_and_sync_left(self):
         self._attach_left_view()
         self._sync_from_left()
+
+    def _on_mod_states_changed(self, changed_mods: dict[str, object]) -> None:
+        """React to MO2's current bulk mod-state notification."""
+        self.host_changed.emit()
 
     def _schedule_refresh(self):
         # Debounce is trailing-edge: a multi-row drag or bulk toggle should
@@ -312,7 +324,7 @@ class Mo2S2VirtualPaksWidget(QWidget):
                 self._refresh_diagnostics()
             self._update_tool_actions()
             if self.sections.currentIndex() in (1, 2):
-                self.catalog_tabs.request(self._items)
+                self.catalog_tabs.request(self._items, signature=signature_before)
             else:
                 self.catalog_tabs.invalidate(self._items)
             prepared = len([i for i in self._items if i.managed])

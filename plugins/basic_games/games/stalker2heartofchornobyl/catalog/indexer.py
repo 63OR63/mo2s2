@@ -18,13 +18,16 @@ import sqlite3
 import zlib
 from typing import Callable, Iterable
 
+from .file_stamp import content_probe
+from .cache_recovery import (InvalidCacheSchema, is_corrupt_database,
+                             quarantine_corrupt_database, register_open, unregister_open)
 from .readers import IndexErrorUnsupported, read_inventory
-from ..paks.virtual_core import Item, _assert_mod_subpath_safe, _is_reparse
+from ..paks.virtual_core import Item, _assert_mod_subpath_safe, _is_reparse, _container_stem
 
 SCHEMA_VERSION = 3
 CHUNK_RESOURCES = 512
 MAX_CHUNK_BYTES = 4 * 1024 * 1024
-PARSER_VERSION = 6
+PARSER_VERSION = 9
 ALLOWED = {'.pak', '.utoc'}
 
 
@@ -409,9 +412,12 @@ def discover(items: Iterable[Item], *,
         if item.kind == 'PAK':
             paths = list(item.companions)
         else:
+            walk_failed = False
+
             def walk_error(exc):
-                # os.walk normally swallows scandir failures. A truncated
-                # discovery is *not* a complete resource inventory.
+                nonlocal walk_failed
+                # Do not publish entries from an incompletely enumerated mod.
+                walk_failed = True
                 errors.append(f'{item.mod_name}: cannot enumerate {exc.filename}: {exc}')
 
             for folder, dirs, files in os.walk(item.source, followlinks=False,
@@ -431,6 +437,8 @@ def discover(items: Iterable[Item], *,
                         safe_dirs.append(name)
                 dirs[:] = safe_dirs
                 paths.extend(Path(folder, name) for name in files)
+            if walk_failed:
+                continue
         # Pre-group companions by normalized stems. Searching every file in a
         # directory for each UTOC would be quadratic in large Zone Kit mods.
         parent_groups: dict[Path, tuple[dict[str, list[Path]], dict[str, list[Path]]]] = {}
@@ -441,6 +449,9 @@ def discover(items: Iterable[Item], *,
                               tuple(parent.iterdir()))
                 exact: dict[str, list[Path]] = defaultdict(list)
                 partitions: dict[str, list[Path]] = defaultdict(list)
+                # Independent Foo_s1.utoc/.pak anchors own their own UCAS.
+                anchors = {p.stem.casefold() for p in candidates
+                           if p.suffix.casefold() in {'.pak', '.utoc'}}
                 for candidate in candidates:
                     ext = candidate.suffix.casefold()
                     if ext not in {'.utoc', '.ucas', '.sig'}:
@@ -448,8 +459,8 @@ def discover(items: Iterable[Item], *,
                     stem = candidate.stem.casefold()
                     exact[stem].append(candidate)
                     if ext == '.ucas':
-                        base, separator, number = stem.rpartition('_s')
-                        if separator and number.isdigit():
+                        base, partition = _container_stem(candidate)
+                        if partition is not None and stem not in anchors:
                             partitions[base].append(candidate)
                 parent_groups[parent] = exact, partitions
             return parent_groups[parent]
@@ -496,7 +507,7 @@ def signature(source: Source) -> str:
         if not member.is_file():
             raise ValueError(f'Not a file: {member}')
         records.append((str(member.absolute()).casefold(), st.st_size, st.st_mtime_ns,
-                        st.st_ctime_ns))
+                        st.st_ctime_ns, content_probe(member)))
     return hashlib.sha256(json.dumps(records, separators=(',', ':'), ensure_ascii=False).encode('utf-8')).hexdigest()
 
 
@@ -570,9 +581,35 @@ def checked_inventory(records, expected_count: int):
 class Catalog:
     """SQLite-backed inventory cache with isolated recovery of corrupt entries."""
     def __init__(self, path: Path):
-        self.path = Path(path)
+        self.path = Path(path).absolute()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(self.path), timeout=15)
+        self.db: sqlite3.Connection | None = None
+        self._registered = False
+        self.recovery_notice = ''
+        # A corrupt cache is disposable, but the damaged bytes are retained.
+        # Never repeat recovery indefinitely or silently reset transient errors.
+        for attempt in range(2):
+            try:
+                # Count even a connection being initialized: a concurrent
+                # worker must never quarantine a file beneath this opener.
+                register_open(self.path)
+                self._registered = True
+                self.db = sqlite3.connect(str(self.path), timeout=15)
+                self._initialize_schema()
+                return
+            except sqlite3.DatabaseError as exc:
+                self._close_connection()
+                if attempt or not is_corrupt_database(exc):
+                    raise
+                saved = quarantine_corrupt_database(self.path)
+                self.recovery_notice = ('Damaged catalog cache quarantined as '
+                                        + (saved.name if saved is not None else '(missing database)')
+                                        + '; inventories must be rebuilt')
+            except BaseException:
+                self._close_connection()
+                raise
+
+    def _initialize_schema(self):
         self.db.execute('PRAGMA foreign_keys=ON')
         self.db.execute('PRAGMA journal_mode=WAL')
         # Development cache schemas are disposable; avoid maintaining
@@ -594,9 +631,32 @@ class Catalog:
             resource_count INTEGER NOT NULL, digest BLOB NOT NULL,
             PRIMARY KEY(container_path, chunk_index))''')
         self.db.commit()
+        # A matching user_version does not prove a healthy table definition.
+        # This metadata-only check catches accidental schema destruction
+        # without a full (potentially expensive) PRAGMA quick_check on startup.
+        expected = {
+            'containers': {'path', 'signature', 'parser_version', 'index_sha256',
+                           'status', 'error', 'resource_count'},
+            'resources': {'container_path', 'chunk_index', 'payload',
+                          'resource_count', 'digest'},
+        }
+        for table, required in expected.items():
+            actual = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
+            if not required <= actual:
+                raise InvalidCacheSchema(f'Damaged catalog schema: {table} columns missing')
+
+    def _close_connection(self):
+        db, self.db = self.db, None
+        try:
+            if db is not None:
+                db.close()
+        finally:
+            if self._registered:
+                self._registered = False
+                unregister_open(self.path)
 
     def close(self):
-        self.db.close()
+        self._close_connection()
 
     def __enter__(self):
         return self
@@ -655,7 +715,10 @@ class Catalog:
                                  for chunk, payload, count, digest in encode_resource_chunks(inv.paths)))
                     cached_rows[path.casefold()] = (after, PARSER_VERSION)
                     indexed += 1
-            except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+            except sqlite3.DatabaseError:
+                # A corrupt cache requires a whole-cache retry, not a bad-PAK row.
+                raise
+            except (OSError, ValueError) as exc:
                 errors += 1
                 state = ('stale' if str(exc) == 'Container changed while indexing' else
                          'unsupported' if isinstance(exc, IndexErrorUnsupported) else 'error')
@@ -860,3 +923,30 @@ class Catalog:
                 if count and key not in present:
                     damaged[key] = 'Cached resource chunks missing'
         return damaged
+
+def run_with_cache_recovery(path: Path, work, *, is_cancelled=None):
+    """Retry a catalog operation once after *actual* SQLite corruption.
+
+    Open-time corruption is handled by Catalog itself. Mid-operation damage
+    requires closing its connection before quarantining the database, then a
+    fresh operation that rebuilds inventories. Never catch transient SQLite
+    failures, and do not continue after cancellation.
+    """
+    recovery_note = ''
+    for attempt in range(2):
+        if is_cancelled is not None and is_cancelled():
+            raise CatalogCancelled()
+        try:
+            with Catalog(path) as db:
+                return work(db, attempt > 0 or bool(db.recovery_notice),
+                            db.recovery_notice or recovery_note)
+        except sqlite3.DatabaseError as exc:
+            if attempt or not is_corrupt_database(exc):
+                raise
+            if is_cancelled is not None and is_cancelled():
+                raise CatalogCancelled() from exc
+            saved = quarantine_corrupt_database(path)
+            recovery_note = ('Damaged catalog cache quarantined as '
+                             + (saved.name if saved is not None else '(missing database)')
+                             + '; inventories must be rebuilt')
+    raise AssertionError('Unreachable catalog recovery state')

@@ -325,6 +325,11 @@ def windows_component_key(name: str) -> str:
     return name.rstrip(' .').casefold()
 
 
+def _fail_tree_walk(exc: OSError) -> None:
+    """Do not silently accept an incomplete mod directory enumeration."""
+    raise OSError(f'Cannot enumerate container tree: {exc}') from exc
+
+
 def _analyze_tree(path: Path) -> tuple[tuple[str, ...], str]:
     """Collect container formats and validate names/bundles in ONE tree walk.
 
@@ -334,7 +339,14 @@ def _analyze_tree(path: Path) -> tuple[tuple[str, ...], str]:
     """
     found: set[str] = set()
     issue = ''
-    for root, dirs, files in os.walk(path, followlinks=False):
+
+    def mark_walk_error(exc: OSError) -> None:
+        nonlocal issue
+        if not issue:
+            issue = f'Cannot enumerate container tree: {exc}'
+
+    for root, dirs, files in os.walk(path, followlinks=False,
+                                     onerror=mark_walk_error):
         if not issue and any(_is_reparse(Path(root, name)) for name in dirs + files):
             issue = 'Symlink or junction in container tree (cannot safely virtualize)'
         # Never traverse linked directory trees, including Windows junctions.
@@ -396,7 +408,9 @@ def _scan_base(owner: Owner, base: Path, managed: bool, *,
             continue
         kind = root_package_kind(zonekit=is_zonekit, direct_container=is_flat_wrapper) or 'NESTED'
         types, path_warning = _analyze_tree(folder)
-        if not types:
+        # Report unreadable/unsafe nested packages even if enumeration failed
+        # before the first PAK/IoStore member was discovered.
+        if not types and not path_warning:
             continue
         name_problem = windows_component_problem(folder.name)
         warning = (f'Unsupported package directory {folder.name!r}: {name_problem}'
@@ -508,7 +522,8 @@ def ue_numeric_bonus(filename: str) -> int:
 def nested_patch_classes(tree: Path) -> tuple[int, ...]:
     """All Unreal numeric PAK-order bonuses present inside one folder tree."""
     classes = set()
-    for folder, dirs, files in os.walk(tree, followlinks=False):
+    for folder, dirs, files in os.walk(tree, followlinks=False,
+                                       onerror=_fail_tree_walk):
         dirs[:] = [d for d in dirs if not _is_reparse(Path(folder, d))]
         for filename in files:
             if filename.lower().endswith('.pak'):
@@ -537,7 +552,8 @@ def _nested_sources(item: Item, dest_root: Path, number: int) -> list[tuple[Path
     caller to an empty on-disk directory skeleton outside the game tree.
     """
     out: list[tuple[Path, Path, bool]] = []
-    for root, dirs, files in os.walk(item.source, followlinks=False):
+    for root, dirs, files in os.walk(item.source, followlinks=False,
+                                     onerror=_fail_tree_walk):
         dirs[:] = sorted((d for d in dirs if not _is_reparse(Path(root, d))), key=str.casefold)
         paths = [Path(root) / filename for filename in sorted(files, key=str.casefold)]
         grouped = _group_files([x for x in paths if x.suffix.casefold() in EXTENSIONS | {SIDECAREXT}])
@@ -746,8 +762,12 @@ def format_mapping_report(items: list[Item], links: list[Link],
                       str(item.source) in w]
             lines.extend('  mapping error: ' + issue for issue in issues)
         if item.kind != 'PAK' and not item.warning:
-            classes = nested_patch_classes(item.source)
-            lines.append(f'  original embedded PAK bonuses: {classes} (virtualized to owner rank)')
+            try:
+                classes = nested_patch_classes(item.source)
+            except OSError as exc:
+                lines.append(f'  original embedded PAK bonuses: unavailable ({exc})')
+            else:
+                lines.append(f'  original embedded PAK bonuses: {classes} (virtualized to owner rank)')
         for link in active:
             lines.append(f'  {link.source} => {link.destination}'
                          + (' [directory]' if link.directory else ''))
@@ -804,7 +824,8 @@ def _windows_path_units(path: Path) -> int:
 def _longest_staged_path(source_dir: Path, destination_dir: Path) -> int:
     """Find the longest projected destination of a nested package on disk."""
     longest = _windows_path_units(destination_dir)
-    for folder, dirs, files in os.walk(source_dir, followlinks=False):
+    for folder, dirs, files in os.walk(source_dir, followlinks=False,
+                                       onerror=_fail_tree_walk):
         dirs[:] = [d for d in dirs if not _is_reparse(Path(folder, d))]
         for name in dirs + files:
             candidate = destination_dir / Path(folder).relative_to(source_dir) / name
